@@ -138,8 +138,8 @@ def try_post_updates(req, state):
                 "msg_id": "{}:{}".format(s["start"], rs),
             }
             try:
-                #resp = req.post(url, json=payload, headers=headers, timeout=10)
-                ok = True #200 <= resp.status_code < 300
+                resp = req.post(url, json=payload, headers=headers, timeout=10)
+                ok = 200 <= resp.status_code < 300
                 if not ok:
                     print("POST failed:", resp.status_code)
                 #resp.close()
