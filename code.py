@@ -67,7 +67,7 @@ def connect_wifi():
     from secrets import secrets
     for i in range(WIFI_RETRIES):
         try:
-            wifi.radio.connect(secrets["ssid"], secrets["password"])
+            wifi.radio.connect(os.getenv('CIRCUITPY_WIFI_SSID'), os.getenv('CIRCUITPY_WIFI_PASSWORD'))
             print("Wi-Fi:", wifi.radio.ipv4_address)
             return True
         except Exception as e:

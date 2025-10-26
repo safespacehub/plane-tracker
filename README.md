@@ -1,14 +1,10 @@
-Sure — here’s the same **README** in plain text form (no Markdown formatting):
-
----
-
 ESP32 Uptime & Session Logger (Store-and-Forward)
 
 This project turns an ESP32 running CircuitPython into a resilient uptime recorder.
 It creates a new “session” each time the device boots, keeps track of how long it runs,
 and syncs those updates to a remote HTTP endpoint whenever Wi-Fi is available.
 
-If the ESP32 goes offline (e.g., a car leaving the garage), it continues tracking uptime locally.
+If the ESP32 goes offline (e.g., a airplane leaving the hangar Wi-Fi network), it continues tracking uptime locally.
 When Wi-Fi returns, it automatically uploads any missed updates — no data loss.
 
 ---
@@ -16,52 +12,43 @@ When Wi-Fi returns, it automatically uploads any missed updates — no data loss
 ## Features
 
 * Accurate session tracking using NTP time on each boot
-* Single JSON file with one entry per session, updated in-place (no endless appending)
+* Single JSON file with one entry per session, updated in-place
 * Automatic store-and-forward: unsent updates are kept until they reach the server
 * Atomic file writes: prevents corruption during power loss
 * Idempotent uploads: duplicate posts are safe (msg_id = session_start:run_seconds)
 * Self-healing: tolerates Wi-Fi failures, DNS issues, power cuts
-* Easily portable to FRAM or SD storage if desired
 
 ---
 
 ## File Structure
-
+```
 /
 ├── code.py          (main application)
 ├── secrets.py       (Wi-Fi & server credentials; you create this)
 └── sessions.json    (generated automatically; holds all sessions)
-
+```
 ---
 
 ## Hardware Requirements
 
-* ESP32 (or compatible) running CircuitPython 9.x or later
-* Optional:
-
-  * I2C FRAM module (for near-infinite write endurance)
-  * microSD card (if you want long-term archives)
-* Wi-Fi network reachable at least occasionally (for example, your garage)
+* ESP32 (or compatible) running CircuitPython 9.x or later. (https://www.adafruit.com/product/5400?srsltid=AfmBOopfVX9sTUdD7UWcMrLCqh4HohZRu2X3p2BO_jnP2IiykY71jl32)
+* Wi-Fi network reachable at least occasionally
 
 ---
 
 ## Creating secrets.py
 
 Create a file named secrets.py in the same directory as code.py:
-
-secrets = {
-"ssid": "YOUR_WIFI_SSID",
-"password": "YOUR_WIFI_PASSWORD",
-
 ```
+secrets = {
+
 # Unique device ID for your deployment
-"device_id": "car-esp32-01",
+"device_id": "airplane-esp32-01",
 
 # URL of your server endpoint that accepts POST JSON
 "ingest_url": "https://example.com/ingest"
-```
-
 }
+```
 
 Keep this file private — never upload it to public repositories.
 
@@ -106,6 +93,7 @@ HTTP Method: POST
 Content-Type: application/json
 
 Example body:
+```
 {
 "device_id": "car-esp32-01",
 "session_start": "2025-10-23T18:00:00Z",
@@ -114,7 +102,7 @@ Example body:
 "status": "open",
 "msg_id": "2025-10-23T18:00:00Z:1200"
 }
-
+```
 Your server should:
 
 * Accept duplicates safely (idempotent on msg_id)
@@ -122,6 +110,17 @@ Your server should:
 * Optionally store/aggregate by device_id and session_start
 
 ---
+
+## Initial ESP32 Setup
+1. Follow Adafruit tutorial to install firmware (https://learn.adafruit.com/adafruit-huzzah32-esp32-feather/circuitpython) or (https://learn.adafruit.com/circuitpython-with-esp32-quick-start/installing-circuitpython)
+2. Over serial connection, baud rate 115200, configure Wi-Fi network settings file settings.toml
+3. Find the local IP address of the ESP32 by executing the following Python code.
+```
+import wifi 
+print("My MAC addr: %02X:%02X:%02X:%02X:%02X:%02X" % tuple(wifi.radio.mac_address)) 
+print("My IP address is", wifi.radio.ipv4_address)
+```
+4. Visit the IP address to view the web GUI
 
 ## Testing the System
 
@@ -141,7 +140,7 @@ Then try the following tests:
 
 
 ## Example Log Output
-
+```
 Boot…
 Wi-Fi: 192.168.1.45
 NTP: 2025-10-23T18:00:02Z
@@ -151,6 +150,7 @@ POST OK 200
 Updated: 2025-10-23T18:00:02Z run 120 s
 Wi-Fi lost; reconnecting…
 NTP failed; continuing offline
+```
 ...
 
 
