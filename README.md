@@ -1,4 +1,4 @@
-ESP32 Uptime & Session Logger (Store-and-Forward)
+# ESP32 Uptime & Session Logger (Store-and-Forward)
 
 This project turns an ESP32 running CircuitPython into a resilient uptime recorder.
 It creates a new “session” each time the device boots, keeps track of how long it runs,
@@ -6,8 +6,6 @@ and syncs those updates to a remote HTTP endpoint whenever Wi-Fi is available.
 
 If the ESP32 goes offline (e.g., a airplane leaving the hangar Wi-Fi network), it continues tracking uptime locally.
 When Wi-Fi returns, it automatically uploads any missed updates — no data loss.
-
----
 
 ## Features
 
@@ -18,7 +16,6 @@ When Wi-Fi returns, it automatically uploads any missed updates — no data loss
 * Idempotent uploads: duplicate posts are safe (msg_id = session_start:run_seconds)
 * Self-healing: tolerates Wi-Fi failures, DNS issues, power cuts
 
----
 
 ## File Structure
 ```
@@ -27,14 +24,12 @@ When Wi-Fi returns, it automatically uploads any missed updates — no data loss
 ├── secrets.py       (Wi-Fi & server credentials; you create this)
 └── sessions.json    (generated automatically; holds all sessions)
 ```
----
 
 ## Hardware Requirements
 
 * ESP32 (or compatible) running CircuitPython 9.x or later. (https://www.adafruit.com/product/5400?srsltid=AfmBOopfVX9sTUdD7UWcMrLCqh4HohZRu2X3p2BO_jnP2IiykY71jl32)
 * Wi-Fi network reachable at least occasionally
 
----
 
 ## Creating secrets.py
 
@@ -50,9 +45,6 @@ secrets = {
 }
 ```
 
-Keep this file private — never upload it to public repositories.
-
----
 
 ## How It Works
 
@@ -85,7 +77,6 @@ Keep this file private — never upload it to public repositories.
    * Keeps counting uptime
    * Queues updates for later transmission
 
----
 
 ## Server Endpoint Specification
 
@@ -109,18 +100,27 @@ Your server should:
 * Respond 200 OK for success
 * Optionally store/aggregate by device_id and session_start
 
----
 
 ## Initial ESP32 Setup
 1. Follow Adafruit tutorial to install firmware (https://learn.adafruit.com/adafruit-huzzah32-esp32-feather/circuitpython) or (https://learn.adafruit.com/circuitpython-with-esp32-quick-start/installing-circuitpython)
-2. Over serial connection, baud rate 115200, configure Wi-Fi network settings file settings.toml
-3. Find the local IP address of the ESP32 by executing the following Python code.
+
+## Connecting to serial output on Debian
+**View available devices** `dmesg | grep tty`
+**Connect to a device** `screen /dev/ttyACM1 115200`
+**Create a settings.toml with Python over serial**
+```
+f = open('settings.toml', 'w') 
+f.write('CIRCUITPY_WIFI_SSID = "my-wifi-name"\n') 
+f.write('CIRCUITPY_WIFI_PASSWORD = "password"\n')
+f.write('CIRCUITPY_WEB_API_PASSWORD = "password"\n') 
+f.close()
+```
+**Find IP address over serial**
 ```
 import wifi 
 print("My MAC addr: %02X:%02X:%02X:%02X:%02X:%02X" % tuple(wifi.radio.mac_address)) 
 print("My IP address is", wifi.radio.ipv4_address)
 ```
-4. Visit the IP address to view the web GUI
 
 ## Testing the System
 
@@ -135,8 +135,6 @@ Then try the following tests:
 * Fake server error (HTTP 500): Retries later, no data loss.
 * Toggle router power: Device reconnects within about 30 seconds.
 * Long offline period: All updates transmit once Wi-Fi returns.
-
----
 
 
 ## Example Log Output
