@@ -1,5 +1,5 @@
 # CircuitPython (ESP32) — Multi-session uptime with in-place updates + store-and-forward
-import time, os, json, rtc, wifi, socketpool, ssl
+import time, os, json, rtc, wifi, socketpool, ssl, binascii
 import adafruit_ntp, adafruit_requests
 
 # ---------- CONFIG ----------
@@ -52,16 +52,19 @@ def save_json_atomic(path, obj):
 
 def load_state():
     if not file_exists(STATE_PATH):
-        return {"device_id": None, "sessions": []}
+        return {"device_uuid": None, "sessions": []}
     try:
         with open(STATE_PATH, "r") as f:
             data = json.load(f)
             if "sessions" not in data or not isinstance(data["sessions"], list):
                 data["sessions"] = []
+            # Migrate old device_id to device_uuid if needed
+            if "device_id" in data and "device_uuid" not in data:
+                data["device_uuid"] = None
             return data
     except Exception as e:
         print("Load error, starting fresh:", e)
-        return {"device_id": None, "sessions": []}
+        return {"device_uuid": None, "sessions": []}
 
 def connect_wifi():
     from secrets import secrets
@@ -90,6 +93,38 @@ def set_time_from_ntp():
             time.sleep(2.0)
     print("NTP failed:", repr(last))
     return False
+
+def get_or_create_device_uuid(state):
+    """
+    Generate a persistent device UUID using MicroPython's crypto.
+    UUID is generated once on first boot and stored in sessions.json.
+    Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    """
+    if "device_uuid" in state and state["device_uuid"]:
+        return state["device_uuid"]
+    
+    # Generate 16 random bytes for UUID
+    uuid_bytes = os.urandom(16)
+    
+    # Set version (4) and variant bits for UUID v4
+    # Version 4: set bits 4-7 of byte 6 to 0100
+    uuid_bytes_list = list(uuid_bytes)
+    uuid_bytes_list[6] = (uuid_bytes_list[6] & 0x0F) | 0x40
+    # Variant: set bits 6-7 of byte 8 to 10
+    uuid_bytes_list[8] = (uuid_bytes_list[8] & 0x3F) | 0x80
+    uuid_bytes = bytes(uuid_bytes_list)
+    
+    # Convert to hex string
+    uuid_str = binascii.hexlify(uuid_bytes).decode('utf-8')
+    
+    # Format as standard UUID with dashes
+    uuid = f"{uuid_str[0:8]}-{uuid_str[8:12]}-{uuid_str[12:16]}-{uuid_str[16:20]}-{uuid_str[20:32]}"
+    
+    # Store in state
+    state["device_uuid"] = uuid
+    print("Generated device UUID:", uuid)
+    
+    return uuid
 
 def prune_fully_acked(state):
     # Keep newest MAX_SESSIONS entries; prefer to drop oldest sessions that are fully acked
@@ -120,22 +155,27 @@ def try_post_updates(req, state):
     """Send any session whose run_seconds > acked_run_seconds. Returns True if progress was made."""
     from secrets import secrets
     url = secrets["ingest_url"]
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer {}".format(secrets.get("access_token", ""))
+    }
 
     progressed = False
+    device_uuid = state.get("device_uuid", "unknown")
+    
     # Send oldest first so the server timeline is monotonic
     for s in state["sessions"]:
         rs = int(s.get("run_seconds", 0))
         ack = int(s.get("acked_run_seconds", 0))
         if rs > ack:
             payload = {
-                "device_id": secrets.get("device_id", "device-unknown"),
+                "device_uuid": device_uuid,
                 "session_start": s["start"],
                 "run_seconds": rs,
                 "last_update": s.get("last_update", None),
                 "status": s.get("status", "open"),
-                # Optional idempotency key: same session_start + run_seconds
-                "msg_id": "{}:{}".format(s["start"], rs),
+                # Idempotency key: device_uuid:session_start:run_seconds
+                "msg_id": "{}:{}:{}".format(device_uuid, s["start"], rs),
             }
             try:
                 resp = req.post(url, json=payload, headers=headers, timeout=10)
@@ -163,11 +203,11 @@ def main():
     wifi_ok = connect_wifi()
     ntp_ok = set_time_from_ntp() if wifi_ok else False
 
-    from secrets import secrets
-    device_id = secrets.get("device_id", "device-unknown")
-
     state = load_state()
-    state["device_id"] = device_id
+    
+    # Generate or retrieve persistent device UUID
+    device_uuid = get_or_create_device_uuid(state)
+    print("Device UUID:", device_uuid)
 
     # Close any previously-open session (power loss) before starting a new one
     for s in state["sessions"]:

@@ -34,16 +34,18 @@ When Wi-Fi returns, it automatically uploads any missed updates — no data loss
 ## Creating secrets.py
 
 Create a file named secrets.py in the same directory as code.py:
-```
+```python
 secrets = {
-
-# Unique device ID for your deployment
-"device_id": "airplane-esp32-01",
-
-# URL of your server endpoint that accepts POST JSON
-"ingest_url": "https://example.com/ingest"
+    # Supabase Edge Function URL
+    "ingest_url": "https://your-project.supabase.co/functions/v1/ingest",
+    
+    # Access token (optional, leave empty)
+    "access_token": "",
 }
 ```
+
+**Note:** Device UUID is now automatically generated on first boot using MicroPython's crypto.
+You no longer need to manually specify a device_id!
 
 
 ## How It Works
@@ -78,27 +80,50 @@ secrets = {
    * Queues updates for later transmission
 
 
-## Server Endpoint Specification
+## Backend Architecture
 
-HTTP Method: POST
-Content-Type: application/json
+This system uses **Supabase** for the backend:
+
+- **PostgreSQL Database** - Stores planes, devices, and sessions
+- **Edge Function** - Ingests data from ESP32 devices
+- **Row Level Security** - Protects user data
+- **Authentication** - Secure user accounts
+
+### Edge Function Endpoint
+
+**POST** `/functions/v1/ingest`
 
 Example body:
-```
+```json
 {
-"device_id": "car-esp32-01",
-"session_start": "2025-10-23T18:00:00Z",
-"run_seconds": 1200,
-"last_update": "2025-10-23T18:20:00Z",
-"status": "open",
-"msg_id": "2025-10-23T18:00:00Z:1200"
+  "device_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "session_start": "2025-10-23T18:00:00Z",
+  "run_seconds": 1200,
+  "last_update": "2025-10-23T18:20:00Z",
+  "status": "open",
+  "msg_id": "550e8400-e29b-41d4-a716-446655440000:2025-10-23T18:00:00Z:1200"
 }
 ```
-Your server should:
 
-* Accept duplicates safely (idempotent on msg_id)
-* Respond 200 OK for success
-* Optionally store/aggregate by device_id and session_start
+The edge function:
+- Accepts duplicates safely (idempotent on msg_id)
+- Updates device last_seen timestamp
+- Returns 200 OK on success
+- Uses service role to bypass RLS
+
+## Web Portal
+
+Access your tracking data through the modern web portal:
+
+- **Dashboard** - Overview of devices, planes, and flight time
+- **Device Management** - Register and assign devices to planes
+- **Plane Management** - Manage your aircraft fleet
+- **Session History** - Complete flight logs with export
+
+Deploy to GitHub Pages or any static hosting service.
+
+See `site_sym/README.md` for portal documentation.
+See `DEPLOYMENT.md` for complete setup guide.
 
 
 ## Initial ESP32 Setup
