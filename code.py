@@ -167,12 +167,6 @@ def try_post_updates(req, state):
     for s in state["sessions"]:
         rs = int(s.get("run_seconds", 0))
         ack = int(s.get("acked_run_seconds", 0))
-        
-        # Skip sessions with invalid timestamps (unsynced NTP)
-        # Database expects proper ISO timestamps, not placeholder strings
-        if s["start"] == "(unsynced)" or s.get("last_update") == "(unsynced)":
-            continue
-        
         if rs > ack:
             payload = {
                 "device_uuid": device_uuid,
@@ -264,17 +258,6 @@ def main():
             if connect_wifi():
                 if not ntp_ok:
                     ntp_ok = set_time_from_ntp()
-                    # If NTP just succeeded, fix any unsynced sessions with current timestamp
-                    # This gives them a valid timestamp so they can be sent to the server
-                    if ntp_ok:
-                        now_iso = iso_utc()
-                        for s in state["sessions"]:
-                            if s["start"] == "(unsynced)":
-                                s["start"] = now_iso
-                                print("Fixed unsynced session start time")
-                            if s.get("last_update") == "(unsynced)":
-                                s["last_update"] = now_iso
-                        save_json_atomic(STATE_PATH, state)
                 try:
                     req = build_requests_session()
                 except Exception as e:
