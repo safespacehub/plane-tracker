@@ -1,9 +1,26 @@
 # CircuitPython (ESP32) — Multi-session uptime with in-place updates + store-and-forward
-import time, os, json, rtc, wifi, socketpool, ssl
+import time, os, json, rtc, wifi, socketpool, ssl, random
 import adafruit_ntp, adafruit_requests
+
+# ---------- UUID Generation ----------
+def generate_uuid():
+    """Generate a UUID v4-like string."""
+    # Generate 16 random bytes
+    rand_bytes = bytearray(16)
+    for i in range(16):
+        rand_bytes[i] = random.randint(0, 255)
+    
+    # Set version (4) and variant (2) bits
+    rand_bytes[6] = (rand_bytes[6] & 0x0F) | 0x40  # version 4
+    rand_bytes[8] = (rand_bytes[8] & 0x3F) | 0x80  # variant 2
+    
+    # Format as UUID string
+    uuid = "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x" % tuple(rand_bytes)
+    return uuid
 
 # ---------- CONFIG ----------
 STATE_PATH = "/sessions.json"   # single JSON file
+DEVICE_ID_PATH = "/device_id.txt"  # persistent device identifier
 SAVE_PERIOD_SEC = 60            # update the current session at most once/min
 POST_PERIOD_SEC = 5             # try to POST pending sessions this often when online
 MAX_SESSIONS = 200              # keep at most this many sessions (drop oldest fully-ack'd)
@@ -17,6 +34,29 @@ def remount_rw():
         storage.remount("/", False)
     except Exception:
         pass
+
+def get_or_create_device_id():
+    """Get the device ID from storage or create a new one."""
+    try:
+        with open(DEVICE_ID_PATH, "r") as f:
+            device_id = f.read().strip()
+            # Validate UUID format
+            if len(device_id) == 36 and device_id.count("-") == 4:
+                return device_id
+    except OSError:
+        pass
+    
+    # Create new device ID if none exists or invalid
+    device_id = generate_uuid()
+    try:
+        with open(DEVICE_ID_PATH, "w") as f:
+            f.write(device_id)
+            f.flush()
+            os.sync()
+    except Exception as e:
+        print("Warning: Could not save device ID:", e)
+    
+    return device_id
 
 def file_exists(p):
     try:
@@ -52,7 +92,7 @@ def save_json_atomic(path, obj):
 
 def load_state():
     if not file_exists(STATE_PATH):
-        return {"device_id": None, "sessions": []}
+        return {"sessions": []}
     try:
         with open(STATE_PATH, "r") as f:
             data = json.load(f)
@@ -61,7 +101,7 @@ def load_state():
             return data
     except Exception as e:
         print("Load error, starting fresh:", e)
-        return {"device_id": None, "sessions": []}
+        return {"sessions": []}
 
 def connect_wifi():
     from secrets import secrets
@@ -116,7 +156,7 @@ def build_requests_session():
     ctx = ssl.create_default_context()
     return adafruit_requests.Session(pool, ctx)
 
-def try_post_updates(req, state):
+def try_post_updates(req, state, device_id):
     """Send any session whose run_seconds > acked_run_seconds. Returns True if progress was made."""
     from secrets import secrets
     url = secrets["ingest_url"]
@@ -129,13 +169,11 @@ def try_post_updates(req, state):
         ack = int(s.get("acked_run_seconds", 0))
         if rs > ack:
             payload = {
-                "device_id": secrets.get("device_id", "device-unknown"),
+                "device_id": device_id,
                 "session_start": s["start"],
                 "run_seconds": rs,
                 "last_update": s.get("last_update", None),
                 "status": s.get("status", "open"),
-                # Optional idempotency key: same session_start + run_seconds
-                "msg_id": "{}:{}".format(s["start"], rs),
             }
             try:
                 resp = req.post(url, json=payload, headers=headers, timeout=10)
@@ -163,11 +201,11 @@ def main():
     wifi_ok = connect_wifi()
     ntp_ok = set_time_from_ntp() if wifi_ok else False
 
-    from secrets import secrets
-    device_id = secrets.get("device_id", "device-unknown")
+    # Get or create persistent device ID
+    device_id = get_or_create_device_id()
+    print("Device ID:", device_id)
 
     state = load_state()
-    state["device_id"] = device_id
 
     # Close any previously-open session (power loss) before starting a new one
     for s in state["sessions"]:
@@ -232,7 +270,7 @@ def main():
                 except Exception as e:
                     print("requests session error:", e)
             if req is not None:
-                progressed = try_post_updates(req, state)
+                progressed = try_post_updates(req, state, device_id)
                 if progressed:
                     # We updated ack counters; persist lazily (piggyback on minute save),
                     # but if you want stronger durability, uncomment the next line:
