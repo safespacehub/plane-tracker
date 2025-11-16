@@ -1,6 +1,11 @@
 # CircuitPython (ESP32) — Multi-session uptime with in-place updates + store-and-forward
+# https://learn.adafruit.com/adafruit-adalogger-featherwing/rtc-with-circuitpython
+
 import time, os, json, rtc, wifi, socketpool, ssl, random
+import board, busio, digitalio, storage
 import adafruit_ntp, adafruit_requests
+import adafruit_sdcard
+from adafruit_pcf8523.pcf8523 import PCF8523
 
 # ---------- UUID Generation ----------
 def generate_uuid():
@@ -19,26 +24,100 @@ def generate_uuid():
     return uuid
 
 # ---------- CONFIG ----------
-STATE_PATH = "/sessions.json"   # single JSON file
-DEVICE_ID_PATH = "/device_id.txt"  # persistent device identifier
+# SD card pin S3 is board.D33
+# SD card pin S2 is board.D10
+SD_CS_PIN = board.D33         # SD card chip select pin (adjust for your board)
+SD_MOUNT_PATH = "/sd"           # Where to mount the SD card
+STATE_FILENAME = "sessions.json"
+DEVICE_ID_FILENAME = "device_id.txt"
 SAVE_PERIOD_SEC = 60            # update the current session at most once/min
 POST_PERIOD_SEC = 5             # try to POST pending sessions this often when online
+WIFI_RECONNECT_COOLDOWN = 60    # wait this long between WiFi reconnection attempts
 MAX_SESSIONS = 200              # keep at most this many sessions (drop oldest fully-ack'd)
 WIFI_RETRIES = 15
 NTP_RETRIES = 8
 
-# ---------- UTILS ----------
-def remount_rw():
+# ---------- STORAGE SETUP ----------
+def init_sd_card():
+    """Initialize SD card. Returns mount path if successful, None if SD card not available."""
     try:
-        import storage
-        storage.remount("/", False)
-    except Exception:
-        pass
+        spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
+        cs = digitalio.DigitalInOut(SD_CS_PIN)
+        sdcard = adafruit_sdcard.SDCard(spi, cs)
+        vfs = storage.VfsFat(sdcard)
+        storage.mount(vfs, SD_MOUNT_PATH)
+        print("SD card mounted at", SD_MOUNT_PATH)
+        return SD_MOUNT_PATH
+    except Exception as e:
+        print("No SD card found:", e)
+        return None
 
-def get_or_create_device_id():
+def get_storage_paths(sd_path):
+    """Get file paths for state and device ID. Uses SD card if available, otherwise internal flash."""
+    if sd_path:
+        # Use SD card
+        state_path = sd_path + "/" + STATE_FILENAME
+        device_id_path = sd_path + "/" + DEVICE_ID_FILENAME
+        print("Using SD card storage")
+        
+        # Migrate device_id from internal flash to SD card if it doesn't exist on SD
+        flash_device_id_path = "/" + DEVICE_ID_FILENAME
+        if not file_exists(device_id_path) and file_exists(flash_device_id_path):
+            print("Migrating device_id from internal flash to SD card...")
+            try:
+                with open(flash_device_id_path, "r") as f:
+                    device_id = f.read().strip()
+                with open(device_id_path, "w") as f:
+                    f.write(device_id)
+                    f.flush()
+                    os.sync()
+                print("Device ID migrated successfully:", device_id)
+            except Exception as e:
+                print("Warning: Could not migrate device ID:", e)
+        
+        # Migrate sessions.json from internal flash to SD card if it doesn't exist on SD
+        flash_state_path = "/" + STATE_FILENAME
+        if not file_exists(state_path) and file_exists(flash_state_path):
+            print("Migrating sessions from internal flash to SD card...")
+            try:
+                with open(flash_state_path, "r") as f:
+                    state_data = f.read()
+                with open(state_path, "w") as f:
+                    f.write(state_data)
+                    f.flush()
+                    os.sync()
+                print("Session data migrated successfully")
+            except Exception as e:
+                print("Warning: Could not migrate session data:", e)
+    else:
+        # Fall back to internal flash
+        state_path = "/" + STATE_FILENAME
+        device_id_path = "/" + DEVICE_ID_FILENAME
+        print("Using internal flash storage")
+        # Try to remount flash as writable
+        try:
+            storage.remount("/", False)
+        except Exception:
+            pass
+    
+    return state_path, device_id_path
+
+# ---------- UTILS ----------
+def init_hardware_rtc():
+    """Initialize the hardware RTC (PCF8523). Returns RTC object or None if not available."""
+    try:
+        i2c = board.I2C()
+        hw_rtc = PCF8523(i2c)
+        print("Hardware RTC found")
+        return hw_rtc
+    except Exception as e:
+        print("No hardware RTC found:", e)
+        return None
+
+def get_or_create_device_id(device_id_path):
     """Get the device ID from storage or create a new one."""
     try:
-        with open(DEVICE_ID_PATH, "r") as f:
+        with open(device_id_path, "r") as f:
             device_id = f.read().strip()
             # Validate UUID format
             if len(device_id) == 36 and device_id.count("-") == 4:
@@ -49,7 +128,7 @@ def get_or_create_device_id():
     # Create new device ID if none exists or invalid
     device_id = generate_uuid()
     try:
-        with open(DEVICE_ID_PATH, "w") as f:
+        with open(device_id_path, "w") as f:
             f.write(device_id)
             f.flush()
             os.sync()
@@ -72,9 +151,16 @@ def _ymdhms_from_dt(dt):
     # Common 9-tuple: (Y, M, D, H, M, S, Wd, Yd, Isdst)
     return (dt[0], dt[1], dt[2], dt[3], dt[4], dt[5])
 
-def iso_utc(dt=None):
+def iso_utc(dt=None, hw_rtc=None):
+    """Get ISO UTC timestamp. Prefers hardware RTC if available, falls back to software RTC."""
     if dt is None:
-        dt = rtc.RTC().datetime
+        if hw_rtc is not None:
+            try:
+                dt = hw_rtc.datetime
+            except Exception:
+                dt = rtc.RTC().datetime
+        else:
+            dt = rtc.RTC().datetime
     y, mo, d, hh, mm, ss = _ymdhms_from_dt(dt)
     return f"{y:04d}-{mo:02d}-{d:02d}T{hh:02d}:{mm:02d}:{ss:02d}Z"
 
@@ -90,11 +176,12 @@ def save_json_atomic(path, obj):
         pass
     os.rename(tmp, path)
 
-def load_state():
-    if not file_exists(STATE_PATH):
+def load_state(state_path):
+    """Load state from the specified path."""
+    if not file_exists(state_path):
         return {"sessions": []}
     try:
-        with open(STATE_PATH, "r") as f:
+        with open(state_path, "r") as f:
             data = json.load(f)
             if "sessions" not in data or not isinstance(data["sessions"], list):
                 data["sessions"] = []
@@ -104,25 +191,44 @@ def load_state():
         return {"sessions": []}
 
 def connect_wifi():
-    from secrets import secrets
+    """Connect to WiFi using environment credentials."""
+    ssid = os.getenv('CIRCUITPY_WIFI_SSID')
+    password = os.getenv('CIRCUITPY_WIFI_PASSWORD')
+    
     for i in range(WIFI_RETRIES):
         try:
-            wifi.radio.connect(os.getenv('CIRCUITPY_WIFI_SSID'), os.getenv('CIRCUITPY_WIFI_PASSWORD'))
-            print("Wi-Fi:", wifi.radio.ipv4_address)
+            wifi.radio.connect(ssid, password)
+            print("Wi-Fi connected:", wifi.radio.ipv4_address)
             return True
         except Exception as e:
             print("Wi-Fi retry", i + 1, "/", WIFI_RETRIES, "-", e)
             time.sleep(1.5)
+    
+    print("Wi-Fi connection failed after", WIFI_RETRIES, "attempts")
     return False
 
-def set_time_from_ntp():
+def set_time_from_ntp(hw_rtc=None):
+    """Sync time from NTP server. Updates both software and hardware RTC if available."""
     pool = socketpool.SocketPool(wifi.radio)
     last = None
     for i in range(NTP_RETRIES):
         try:
             ntp = adafruit_ntp.NTP(pool, server="pool.ntp.org", tz_offset=0)
-            rtc.RTC().datetime = ntp.datetime
-            print("NTP:", iso_utc())
+            ntp_time = ntp.datetime
+            
+            # Update software RTC
+            rtc.RTC().datetime = ntp_time
+            
+            # Update hardware RTC if available
+            if hw_rtc is not None:
+                try:
+                    hw_rtc.datetime = ntp_time
+                    print("NTP synced to hardware RTC:", iso_utc(ntp_time))
+                except Exception as e:
+                    print("Warning: Could not sync hardware RTC:", e)
+            else:
+                print("NTP synced:", iso_utc(ntp_time))
+            
             return True
         except Exception as e:
             last = e
@@ -152,129 +258,162 @@ def prune_fully_acked(state):
 
 # ---------- NETWORK SEND ----------
 def build_requests_session():
-    pool = socketpool.SocketPool(wifi.radio)
-    ctx = ssl.create_default_context()
-    return adafruit_requests.Session(pool, ctx)
+    """Build and return a requests session, or None if it fails."""
+    try:
+        pool = socketpool.SocketPool(wifi.radio)
+        ctx = ssl.create_default_context()
+        return adafruit_requests.Session(pool, ctx)
+    except Exception as e:
+        print("Failed to create requests session:", e)
+        return None
 
-def try_post_updates(req, state, device_id):
+def try_post_updates(req, state, device_id, ingest_url):
     """Send any session whose run_seconds > acked_run_seconds. Returns True if progress was made."""
-    from secrets import secrets
-    url = secrets["ingest_url"]
     headers = {"Content-Type": "application/json"}
-
     progressed = False
+    
     # Send oldest first so the server timeline is monotonic
     for s in state["sessions"]:
         rs = int(s.get("run_seconds", 0))
         ack = int(s.get("acked_run_seconds", 0))
+        status = s.get("status", "open")
+        
         if rs > ack:
             payload = {
                 "device_id": device_id,
                 "session_start": s["start"],
                 "run_seconds": rs,
-                "last_update": s.get("last_update", None),
-                "status": s.get("status", "open"),
+                "last_update": s.get("last_update"),
+                "status": status,
             }
+            
             try:
-                resp = req.post(url, json=payload, headers=headers, timeout=10)
-                ok = 200 <= resp.status_code < 300
-                if not ok:
-                    print("POST failed:", resp.status_code)
-                #resp.close()
-                if ok:
+                resp = req.post(ingest_url, json=payload, headers=headers, timeout=10)
+                
+                if 200 <= resp.status_code < 300:
                     s["acked_run_seconds"] = rs
                     progressed = True
-                    print("POST acknowledged")
+                    if status == "closed":
+                        print("POST acknowledged (closed session)")
+                    else:
+                        print("POST acknowledged")
                 else:
-                    # Stop on first failure to avoid hammering
-                    break
+                    print("POST failed:", resp.status_code)
+                    break  # Stop on first failure to avoid hammering
+                    
             except Exception as e:
                 print("POST error:", e)
-                break
+                break  # Stop on network error
+                
     return progressed
 
 # ---------- MAIN ----------
 def main():
-    remount_rw()
+    from secrets import secrets
+    
     print("Boot…")
 
+    # Initialize SD card storage (falls back to internal flash if not available)
+    sd_path = init_sd_card()
+    state_path, device_id_path = get_storage_paths(sd_path)
+
+    # Initialize hardware RTC
+    hw_rtc = init_hardware_rtc()
+
+    # Connect to WiFi and sync time
     wifi_ok = connect_wifi()
-    ntp_ok = set_time_from_ntp() if wifi_ok else False
+    ntp_ok = set_time_from_ntp(hw_rtc) if wifi_ok else False
+    
+    # If NTP failed but we have hardware RTC, sync software RTC from hardware
+    if not ntp_ok and hw_rtc is not None:
+        try:
+            rtc.RTC().datetime = hw_rtc.datetime
+            print("Time loaded from hardware RTC:", iso_utc(hw_rtc=hw_rtc))
+            ntp_ok = True  # We have valid time from hardware RTC
+        except Exception as e:
+            print("Could not read hardware RTC:", e)
 
     # Get or create persistent device ID
-    device_id = get_or_create_device_id()
+    device_id = get_or_create_device_id(device_id_path)
     print("Device ID:", device_id)
 
-    state = load_state()
-
-    # Close any previously-open session (power loss) before starting a new one
+    # Load state and close any previously-open session
+    state = load_state(state_path)
+    closed_count = 0
     for s in state["sessions"]:
         if s.get("status") != "closed":
             s["status"] = "closed"
+            # Force re-send by reducing acked_run_seconds by 1
+            # This ensures the closed status gets sent to server
+            ack = int(s.get("acked_run_seconds", 0))
+            if ack > 0:
+                s["acked_run_seconds"] = ack - 1
+            closed_count += 1
+    
+    if closed_count > 0:
+        print("Marked", closed_count, "session(s) as closed")
 
     # Start new session (one entry per boot)
     session = {
-        "start": iso_utc() if ntp_ok else "(unsynced)",
+        "start": iso_utc(hw_rtc=hw_rtc) if ntp_ok else "(unsynced)",
         "run_seconds": 0,
         "acked_run_seconds": 0,
-        "last_update": iso_utc() if ntp_ok else "(unsynced)",
+        "last_update": iso_utc(hw_rtc=hw_rtc) if ntp_ok else "(unsynced)",
         "status": "open"
     }
     state["sessions"].append(session)
-    save_json_atomic(STATE_PATH, state)
+    save_json_atomic(state_path, state)
     print("New session:", session["start"])
 
+    # Initialize timing and network
     boot_t0 = time.monotonic()
     last_save_t = -9999
     last_post_t = -9999
-    req = None
-
-    # On boot, if online, create requests session
-    if wifi.radio.ipv4_address:
-        try:
-            req = build_requests_session()
-        except Exception as e:
-            print("requests session error:", e)
+    last_wifi_attempt = -9999
+    req = build_requests_session() if wifi.radio.ipv4_address else None
+    ingest_url = secrets["ingest_url"]
 
     while True:
         now = time.monotonic()
+        now_int = int(now)
 
         # Periodic session update (in-place)
-        if int(now) - last_save_t >= SAVE_PERIOD_SEC:
-            last_save_t = int(now)
+        if now_int - last_save_t >= SAVE_PERIOD_SEC:
+            last_save_t = now_int
             elapsed = int(now - boot_t0)
             session["run_seconds"] = elapsed
-            session["last_update"] = iso_utc() if ntp_ok else "(unsynced)"
-            save_json_atomic(STATE_PATH, state)
+            session["last_update"] = iso_utc(hw_rtc=hw_rtc) if ntp_ok else "(unsynced)"
+            save_json_atomic(state_path, state)
             print("Updated:", session["start"], "run", elapsed, "s")
 
-        # Networking: reconnect if needed
-        if not wifi.radio.ipv4_address:
-            # backoff-ish reconnect
-            print("No Wi-Fi; reconnecting soon…")
+        # Networking: reconnect if needed (with cooldown to avoid hammering)
+        if not wifi.radio.ipv4_address and (now_int - last_wifi_attempt >= WIFI_RECONNECT_COOLDOWN):
+            last_wifi_attempt = now_int
+            print("No Wi-Fi; attempting reconnection…")
             time.sleep(2)
             if connect_wifi():
-                if not ntp_ok:
-                    ntp_ok = set_time_from_ntp()
-                try:
-                    req = build_requests_session()
-                except Exception as e:
-                    print("requests session error:", e)
+                print("Reconnection successful!")
+                # Try to sync time from NTP (especially if hardware RTC wasn't present at boot)
+                if set_time_from_ntp(hw_rtc):
+                    ntp_ok = True
+                req = build_requests_session()
+            else:
+                print("Reconnection failed. Will retry in", WIFI_RECONNECT_COOLDOWN, "seconds")
 
         # Try to POST pending updates
-        if wifi.radio.ipv4_address and (int(now) - last_post_t >= POST_PERIOD_SEC):
-            last_post_t = int(now)
+        if wifi.radio.ipv4_address and (now_int - last_post_t >= POST_PERIOD_SEC):
+            last_post_t = now_int
+            
+            # Ensure we have a requests session
             if req is None:
-                try:
-                    req = build_requests_session()
-                except Exception as e:
-                    print("requests session error:", e)
+                req = build_requests_session()
+            
+            # Try to send updates
             if req is not None:
-                progressed = try_post_updates(req, state, device_id)
+                progressed = try_post_updates(req, state, device_id, ingest_url)
                 if progressed:
-                    # We updated ack counters; persist lazily (piggyback on minute save),
-                    # but if you want stronger durability, uncomment the next line:
-                    # save_json_atomic(STATE_PATH, state)
+                    # Persist ack counters immediately to prevent duplicate sends
+                    save_json_atomic(state_path, state)
                     prune_fully_acked(state)
 
         time.sleep(0.25)
